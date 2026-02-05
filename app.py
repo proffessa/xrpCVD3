@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 # =========================
 EXCHANGES = [
     "Binance", "Coinbase", "OKX", "Bybit", "Kraken",
-    "Bitstamp", "Gate", "MEXC", "HTX"
+    "Bitstamp", "Gate", "MEXC", "HTX", "Upbit"
 ]
 
 data = {ex: [] for ex in EXCHANGES}
@@ -25,7 +25,7 @@ price_data = []
 LOCK = threading.Lock()
 
 # =========================
-# WEBSOCKET FUNCTIONS
+# WEBSOCKETS
 # =========================
 async def binance_cvd():
     async with websockets.connect("wss://stream.binance.com:9443/ws/xrpusdt@trade") as ws:
@@ -183,6 +183,22 @@ async def htx():
                         cvd["HTX"] += delta
                         data["HTX"].append((datetime.utcnow(), cvd["HTX"]))
 
+
+# 🔹 UPBIT (XRP/KRW)
+async def upbit():
+    async with websockets.connect("wss://api.upbit.com/websocket/v1") as ws:
+        await ws.send(json.dumps([
+            {"ticket": "xrp"},
+            {"type": "trade", "codes": ["KRW-XRP"]}
+        ]))
+        while True:
+            msg = json.loads(await ws.recv())
+            vol = float(msg["trade_volume"])
+            delta = vol if msg["ask_bid"] == "BID" else -vol
+            with LOCK:
+                cvd["Upbit"] += delta
+                data["Upbit"].append((datetime.utcnow(), cvd["Upbit"]))
+
 # =========================
 # THREADS
 # =========================
@@ -192,8 +208,8 @@ def run_ws(coro):
     loop.run_until_complete(coro)
 
 for func in [
-    binance_cvd, binance_price, coinbase, okx,
-    bybit, kraken, bitstamp, gate, mexc, htx
+    binance_cvd, binance_price, coinbase, okx, bybit,
+    kraken, bitstamp, gate, mexc, htx, upbit
 ]:
     threading.Thread(target=run_ws, args=(func(),), daemon=True).start()
 
@@ -216,14 +232,19 @@ def update(_):
         for ex, vals in data.items():
             if vals:
                 df = pd.DataFrame(vals, columns=["time", "cvd"])
-                fig.add_trace(go.Scatter(x=df["time"], y=df["cvd"], mode="lines", name=ex))
+                fig.add_trace(go.Scatter(
+                    x=df["time"], y=df["cvd"],
+                    mode="lines", name=ex
+                ))
 
         if price_data:
             pdf = pd.DataFrame(price_data, columns=["time", "price"])
             fig.add_trace(go.Scatter(
                 x=pdf["time"], y=pdf["price"],
-                mode="lines", name="XRP Price (Binance)",
-                yaxis="y2", line=dict(color="orange", width=2)
+                mode="lines",
+                name="XRP Price (Binance)",
+                yaxis="y2",
+                line=dict(color="orange", width=2)
             ))
 
     fig.update_layout(
@@ -234,6 +255,7 @@ def update(_):
         legend=dict(orientation="h")
     )
     return fig
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8050, debug=False)
