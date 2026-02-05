@@ -7,7 +7,7 @@ import dash
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
-import websocket
+import websockets
 import json
 import requests
 
