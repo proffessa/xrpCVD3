@@ -1,261 +1,212 @@
 import asyncio
 import json
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 import pandas as pd
-import websockets
+import plotly.graph_objs as go
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
-import plotly.graph_objects as go
+import websockets
+import requests
 
-# =========================
-# GLOBAL DATA
-# =========================
-EXCHANGES = [
-    "Binance", "Coinbase", "OKX", "Bybit", "Kraken",
-    "Bitstamp", "Gate", "MEXC", "HTX", "Upbit"
-]
+# ===================== CONFIG =====================
+SYMBOLS = {
+    "binance": "xrpusdt",
+    "coinbase": "XRP-USD",
+    "okx": "XRP-USDT",
+    "bybit": "XRPUSDT",
+    "kraken": "XRP/USD",
+    "bitstamp": "xrpusd",
+    "upbit": "KRW-XRP",
+}
 
-data = {ex: [] for ex in EXCHANGES}
-cvd = {ex: 0.0 for ex in EXCHANGES}
+WINDOW_HOURS = 36
+MAX_AGE = timedelta(hours=WINDOW_HOURS)
 
-price_data = []
+# ===================== STORAGE =====================
+data = {
+    ex: pd.DataFrame(columns=["time", "cvd_raw"])
+    for ex in SYMBOLS
+}
 
-LOCK = threading.Lock()
+price_data = pd.DataFrame(columns=["time", "price"])
 
-# =========================
-# WEBSOCKETS
-# =========================
-async def binance_cvd():
-    async with websockets.connect("wss://stream.binance.com:9443/ws/xrpusdt@trade") as ws:
-        while True:
-            msg = json.loads(await ws.recv())
-            vol = float(msg["q"])
-            delta = -vol if msg["m"] else vol
-            with LOCK:
-                cvd["Binance"] += delta
-                data["Binance"].append((datetime.utcnow(), cvd["Binance"]))
+lock = threading.Lock()
 
+# ===================== HELPERS =====================
+def trim_old(df):
+    cutoff = datetime.utcnow() - MAX_AGE
+    return df[df["time"] >= cutoff]
 
-async def binance_price():
-    async with websockets.connect("wss://stream.binance.com:9443/ws/xrpusdt@trade") as ws:
-        while True:
-            msg = json.loads(await ws.recv())
-            with LOCK:
-                price_data.append((datetime.utcnow(), float(msg["p"])))
+def indexed(series):
+    if len(series) == 0:
+        return series
+    return series - series.iloc[0]
 
+# ===================== BINANCE PRICE =====================
+def fetch_binance_price():
+    global price_data
+    while True:
+        try:
+            r = requests.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "XRPUSDT"},
+                timeout=5,
+            )
+            p = float(r.json()["price"])
+            with lock:
+                price_data.loc[len(price_data)] = [datetime.utcnow(), p]
+                price_data = trim_old(price_data)
+        except:
+            pass
+        time.sleep(5)
 
-async def coinbase():
-    async with websockets.connect("wss://ws-feed.exchange.coinbase.com") as ws:
-        await ws.send(json.dumps({
-            "type": "subscribe",
-            "channels": [{"name": "matches", "product_ids": ["XRP-USD"]}]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if msg.get("type") == "match":
-                vol = float(msg["size"])
-                delta = vol if msg["side"] == "buy" else -vol
-                with LOCK:
-                    cvd["Coinbase"] += delta
-                    data["Coinbase"].append((datetime.utcnow(), cvd["Coinbase"]))
+# ===================== WEBSOCKET HANDLER =====================
+async def trade_stream(exchange):
+    uri_map = {
+        "binance": "wss://stream.binance.com:9443/ws/xrpusdt@trade",
+        "coinbase": "wss://ws-feed.exchange.coinbase.com",
+        "okx": "wss://ws.okx.com:8443/ws/v5/public",
+        "bybit": "wss://stream.bybit.com/v5/public/spot",
+        "kraken": "wss://ws.kraken.com",
+        "bitstamp": "wss://ws.bitstamp.net",
+        "upbit": "wss://api.upbit.com/websocket/v1",
+    }
 
+    async with websockets.connect(uri_map[exchange]) as ws:
+        # ---- SUBSCRIPTIONS ----
+        if exchange == "coinbase":
+            await ws.send(json.dumps({
+                "type": "subscribe",
+                "channels": ["matches"],
+                "product_ids": ["XRP-USD"],
+            }))
 
-async def okx():
-    async with websockets.connect("wss://ws.okx.com:8443/ws/v5/public") as ws:
-        await ws.send(json.dumps({
-            "op": "subscribe",
-            "args": [{"channel": "trades", "instId": "XRP-USDT"}]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                for t in msg["data"]:
-                    vol = float(t["sz"])
-                    delta = vol if t["side"] == "buy" else -vol
-                    with LOCK:
-                        cvd["OKX"] += delta
-                        data["OKX"].append((datetime.utcnow(), cvd["OKX"]))
+        elif exchange == "okx":
+            await ws.send(json.dumps({
+                "op": "subscribe",
+                "args": [{"channel": "trades", "instId": "XRP-USDT"}],
+            }))
 
+        elif exchange == "bybit":
+            await ws.send(json.dumps({
+                "op": "subscribe",
+                "args": ["publicTrade.XRPUSDT"],
+            }))
 
-async def bybit():
-    async with websockets.connect("wss://stream.bybit.com/v5/public/spot") as ws:
-        await ws.send(json.dumps({
-            "op": "subscribe",
-            "args": ["publicTrade.XRPUSDT"]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                for t in msg["data"]:
-                    vol = float(t["v"])
-                    delta = vol if t["S"] == "Buy" else -vol
-                    with LOCK:
-                        cvd["Bybit"] += delta
-                        data["Bybit"].append((datetime.utcnow(), cvd["Bybit"]))
+        elif exchange == "kraken":
+            await ws.send(json.dumps({
+                "event": "subscribe",
+                "pair": ["XRP/USD"],
+                "subscription": {"name": "trade"},
+            }))
 
+        elif exchange == "bitstamp":
+            await ws.send(json.dumps({
+                "event": "bts:subscribe",
+                "data": {"channel": "live_trades_xrpusd"},
+            }))
 
-async def kraken():
-    async with websockets.connect("wss://ws.kraken.com") as ws:
-        await ws.send(json.dumps({
-            "event": "subscribe",
-            "pair": ["XRP/USD"],
-            "subscription": {"name": "trade"}
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if isinstance(msg, list):
-                for t in msg[1]:
-                    vol = float(t[1])
-                    delta = vol if t[3] == "b" else -vol
-                    with LOCK:
-                        cvd["Kraken"] += delta
-                        data["Kraken"].append((datetime.utcnow(), cvd["Kraken"]))
+        elif exchange == "upbit":
+            await ws.send(json.dumps([
+                {"ticket": "xrp"},
+                {"type": "trade", "codes": ["KRW-XRP"]},
+            ]))
 
+        # ---- LOOP ----
+        async for msg in ws:
+            now = datetime.utcnow()
+            vol = 0
 
-async def bitstamp():
-    async with websockets.connect("wss://ws.bitstamp.net") as ws:
-        await ws.send(json.dumps({
-            "event": "bts:subscribe",
-            "data": {"channel": "live_trades_xrpusd"}
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                vol = float(msg["data"]["amount"])
-                delta = vol if msg["data"]["type"] == 0 else -vol
-                with LOCK:
-                    cvd["Bitstamp"] += delta
-                    data["Bitstamp"].append((datetime.utcnow(), cvd["Bitstamp"]))
+            try:
+                m = json.loads(msg)
 
+                if exchange == "binance":
+                    vol = float(m["q"]) if m["m"] else -float(m["q"])
 
-async def gate():
-    async with websockets.connect("wss://api.gateio.ws/ws/v4/") as ws:
-        await ws.send(json.dumps({
-            "time": int(datetime.utcnow().timestamp()),
-            "channel": "spot.trades",
-            "event": "subscribe",
-            "payload": ["XRP_USDT"]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if msg.get("result"):
-                for t in msg["result"]:
-                    vol = float(t["amount"])
-                    delta = vol if t["side"] == "buy" else -vol
-                    with LOCK:
-                        cvd["Gate"] += delta
-                        data["Gate"].append((datetime.utcnow(), cvd["Gate"]))
+                elif exchange == "coinbase":
+                    vol = float(m["size"]) if m["side"] == "buy" else -float(m["size"])
 
+                elif exchange == "okx":
+                    t = m["data"][0]
+                    vol = float(t["sz"]) if t["side"] == "buy" else -float(t["sz"])
 
-async def mexc():
-    async with websockets.connect("wss://wbs.mexc.com/ws") as ws:
-        await ws.send(json.dumps({
-            "method": "SUBSCRIPTION",
-            "params": ["spot@public.deals.v3.api@XRPUSDT"],
-            "id": 1
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                for t in msg["data"]:
-                    vol = float(t["v"])
-                    delta = vol if t["S"] == "BUY" else -vol
-                    with LOCK:
-                        cvd["MEXC"] += delta
-                        data["MEXC"].append((datetime.utcnow(), cvd["MEXC"]))
+                elif exchange == "bybit":
+                    t = m["data"][0]
+                    vol = float(t["v"]) if t["S"] == "Buy" else -float(t["v"])
 
+                elif exchange == "kraken":
+                    t = m[1][0]
+                    vol = float(t[1]) if t[3] == "b" else -float(t[1])
 
-async def htx():
-    async with websockets.connect("wss://api.huobi.pro/ws") as ws:
-        await ws.send(json.dumps({
-            "sub": "market.xrpusdt.trade.detail",
-            "id": "xrp"
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "tick" in msg:
-                for t in msg["tick"]["data"]:
-                    vol = float(t["amount"])
-                    delta = vol if t["direction"] == "buy" else -vol
-                    with LOCK:
-                        cvd["HTX"] += delta
-                        data["HTX"].append((datetime.utcnow(), cvd["HTX"]))
+                elif exchange == "bitstamp":
+                    t = m["data"]
+                    vol = float(t["amount"]) if t["type"] == 0 else -float(t["amount"])
 
+                elif exchange == "upbit":
+                    vol = float(m["trade_volume"]) if m["ask_bid"] == "BID" else -float(m["trade_volume"])
 
-# 🔹 UPBIT (XRP/KRW)
-async def upbit():
-    async with websockets.connect("wss://api.upbit.com/websocket/v1") as ws:
-        await ws.send(json.dumps([
-            {"ticket": "xrp"},
-            {"type": "trade", "codes": ["KRW-XRP"]}
-        ]))
-        while True:
-            msg = json.loads(await ws.recv())
-            vol = float(msg["trade_volume"])
-            delta = vol if msg["ask_bid"] == "BID" else -vol
-            with LOCK:
-                cvd["Upbit"] += delta
-                data["Upbit"].append((datetime.utcnow(), cvd["Upbit"]))
+                with lock:
+                    df = data[exchange]
+                    prev = df["cvd_raw"].iloc[-1] if len(df) else 0
+                    df.loc[len(df)] = [now, prev + vol]
+                    data[exchange] = trim_old(df)
 
-# =========================
-# THREADS
-# =========================
-def run_ws(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(coro)
+            except:
+                pass
 
-for func in [
-    binance_cvd, binance_price, coinbase, okx, bybit,
-    kraken, bitstamp, gate, mexc, htx, upbit
-]:
-    threading.Thread(target=run_ws, args=(func(),), daemon=True).start()
+# ===================== THREAD STARTER =====================
+def start_ws(exchange):
+    asyncio.run(trade_stream(exchange))
 
-# =========================
-# DASH
-# =========================
+for ex in SYMBOLS:
+    threading.Thread(target=start_ws, args=(ex,), daemon=True).start()
+
+threading.Thread(target=fetch_binance_price, daemon=True).start()
+
+# ===================== DASH APP =====================
 app = Dash(__name__)
-
 app.layout = html.Div([
-    html.H3("XRP – 10 Spot Exchange CVD + Binance Price"),
+    html.H2("XRP Spot Indexed CVD (36h) + Binance Price"),
     dcc.Graph(id="graph"),
-    dcc.Interval(id="interval", interval=2000)
+    dcc.Interval(id="interval", interval=3000),
 ])
 
 @app.callback(Output("graph", "figure"), Input("interval", "n_intervals"))
 def update(_):
     fig = go.Figure()
 
-    with LOCK:
-        for ex, vals in data.items():
-            if vals:
-                df = pd.DataFrame(vals, columns=["time", "cvd"])
-                fig.add_trace(go.Scatter(
-                    x=df["time"], y=df["cvd"],
-                    mode="lines", name=ex
-                ))
-
-        if price_data:
-            pdf = pd.DataFrame(price_data, columns=["time", "price"])
+    with lock:
+        for ex, df in data.items():
+            if len(df) < 2:
+                continue
             fig.add_trace(go.Scatter(
-                x=pdf["time"], y=pdf["price"],
+                x=df["time"],
+                y=indexed(df["cvd_raw"]),
                 mode="lines",
+                name=f"{ex.capitalize()} CVD",
+            ))
+
+        if len(price_data) > 2:
+            fig.add_trace(go.Scatter(
+                x=price_data["time"],
+                y=price_data["price"],
                 name="XRP Price (Binance)",
                 yaxis="y2",
-                line=dict(color="orange", width=2)
+                line=dict(color="orange"),
             ))
 
     fig.update_layout(
+        xaxis=dict(title="Time"),
+        yaxis=dict(title="Indexed CVD"),
+        yaxis2=dict(title="Price", overlaying="y", side="right"),
         template="plotly_dark",
-        xaxis=dict(type="date"),
-        yaxis=dict(title="CVD"),
-        yaxis2=dict(title="XRP Price", overlaying="y", side="right"),
-        legend=dict(orientation="h")
+        legend=dict(orientation="h"),
     )
+
     return fig
 
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    app.run(host="0.0.0.0", port=8050)
