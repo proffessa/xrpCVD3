@@ -1,138 +1,141 @@
-
 import asyncio
+import time
+from collections import deque, defaultdict
+
+import websockets
 import json
 import threading
-from datetime import datetime
 
-import pandas as pd
-import websockets
-from dash import Dash, dcc, html
-from dash.dependencies import Output, Input
-import plotly.graph_objects as go
+from flask import Flask, render_template_string
+import plotly.graph_objs as go
 
-data = {
-    "Binance": [],
-    "Coinbase": [],
-    "OKX": [],
-    "Bybit": [],
-    "Kraken": []
+# ---------------- CONFIG ----------------
+WINDOW_HOURS = 36
+BUCKET_MS = 100
+MAX_WINDOW_SEC = WINDOW_HOURS * 3600
+
+EXCHANGES = {
+    "binance": "wss://stream.binance.com:9443/ws/xrpusdt@trade",
 }
 
-cvd = {k: 0 for k in data.keys()}
+PRICE_WS = "wss://stream.binance.com:9443/ws/xrpusdt@trade"
 
-async def binance():
-    url = "wss://stream.binance.com:9443/ws/xrpusdt@trade"
-    async with websockets.connect(url) as ws:
-        while True:
-            msg = json.loads(await ws.recv())
-            vol = float(msg["q"])
-            delta = -vol if msg["m"] else vol
-            cvd["Binance"] += delta
-            data["Binance"].append((datetime.now(), cvd["Binance"]))
+# ---------------- STATE ----------------
+cvd = 0.0
+cvd_buckets = deque()  # (timestamp, delta)
+bucket_accumulator = defaultdict(float)
 
-async def coinbase():
-    url = "wss://ws-feed.exchange.coinbase.com"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "type": "subscribe",
-            "channels": [{"name": "matches", "product_ids": ["XRP-USD"]}]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if msg.get("type") == "match":
-                vol = float(msg["size"])
-                delta = vol if msg["side"] == "buy" else -vol
-                cvd["Coinbase"] += delta
-                data["Coinbase"].append((datetime.now(), cvd["Coinbase"]))
+price_points = deque(maxlen=5000)
 
-async def okx():
-    url = "wss://ws.okx.com:8443/ws/v5/public"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "op": "subscribe",
-            "args": [{"channel": "trades", "instId": "XRP-USDT"}]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                for t in msg["data"]:
-                    vol = float(t["sz"])
-                    delta = vol if t["side"] == "buy" else -vol
-                    cvd["OKX"] += delta
-                    data["OKX"].append((datetime.now(), cvd["OKX"]))
+lock = threading.Lock()
 
-async def bybit():
-    url = "wss://stream.bybit.com/v5/public/spot"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "op": "subscribe",
-            "args": ["publicTrade.XRPUSDT"]
-        }))
-        while True:
-            msg = json.loads(await ws.recv())
-            if "data" in msg:
-                for t in msg["data"]:
-                    vol = float(t["v"])
-                    delta = vol if t["S"] == "Buy" else -vol
-                    cvd["Bybit"] += delta
-                    data["Bybit"].append((datetime.now(), cvd["Bybit"]))
+# ---------------- HELPERS ----------------
+def cleanup_old_data(now):
+    global cvd
+    cutoff = now - MAX_WINDOW_SEC
+    while cvd_buckets and cvd_buckets[0][0] < cutoff:
+        ts, delta = cvd_buckets.popleft()
+        cvd -= delta
 
-async def kraken():
-    url = "wss://ws.kraken.com"
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "event": "subscribe",
-            "pair": ["XRP/USD"],
-            "subscription": {"name": "trade"}
-        }))
-        while True:
-            msg = await ws.recv()
-            msg = json.loads(msg)
-            if isinstance(msg, list):
-                for trade in msg[1]:
-                    vol = float(trade[1])
-                    delta = vol if trade[3] == "b" else -vol
-                    cvd["Kraken"] += delta
-                    data["Kraken"].append((datetime.now(), cvd["Kraken"]))
+# ---------------- WEBSOCKET HANDLERS ----------------
+async def binance_trades():
+    global cvd
+    async with websockets.connect(EXCHANGES["binance"]) as ws:
+        async for msg in ws:
+            data = json.loads(msg)
+            qty = float(data["q"])
+            is_sell = data["m"]
+            delta = -qty if is_sell else qty
 
-def start_ws():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(asyncio.gather(
-        binance(), coinbase(), okx(), bybit(), kraken()
+            now = time.time()
+            bucket_ts = int(now * 1000 // BUCKET_MS * BUCKET_MS) / 1000
+
+            with lock:
+                bucket_accumulator[bucket_ts] += delta
+
+async def price_stream():
+    async with websockets.connect(PRICE_WS) as ws:
+        async for msg in ws:
+            data = json.loads(msg)
+            price = float(data["p"])
+            ts = time.time()
+
+            with lock:
+                price_points.append((ts, price))
+
+# ---------------- AGGREGATOR ----------------
+def aggregator():
+    global cvd
+    while True:
+        time.sleep(BUCKET_MS / 1000)
+        now = time.time()
+
+        with lock:
+            keys = list(bucket_accumulator.keys())
+            for k in keys:
+                delta = bucket_accumulator.pop(k)
+                cvd += delta
+                cvd_buckets.append((k, delta))
+
+            cleanup_old_data(now)
+
+# ---------------- FLASK APP ----------------
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    with lock:
+        times = [t for t, _ in cvd_buckets]
+        cvd_vals = []
+        running = 0
+        for _, d in cvd_buckets:
+            running += d
+            cvd_vals.append(running)
+
+        price_t = [t for t, _ in price_points]
+        price_v = [p for _, p in price_points]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=cvd_vals,
+        name="CVD (36h)",
+        yaxis="y1",
+        line=dict(color="cyan")
     ))
 
-threading.Thread(target=start_ws, daemon=True).start()
+    fig.add_trace(go.Scatter(
+        x=price_t,
+        y=price_v,
+        name="XRP Price (Binance)",
+        yaxis="y2",
+        line=dict(color="orange")
+    ))
 
-app = Dash(__name__)
-
-app.layout = html.Div([
-    html.H2("XRP Spot CVD – Multi Exchange"),
-    dcc.Graph(id="cvd-graph"),
-    dcc.Interval(id="interval", interval=2000)
-])
-
-@app.callback(
-    Output("cvd-graph", "figure"),
-    Input("interval", "n_intervals")
-)
-def update(_):
-    fig = go.Figure()
-    for ex, vals in data.items():
-        if len(vals) > 10:
-            df = pd.DataFrame(vals, columns=["time", "cvd"])
-            fig.add_trace(go.Scatter(
-                x=df["time"],
-                y=df["cvd"],
-                mode="lines",
-                name=ex
-            ))
     fig.update_layout(
         template="plotly_dark",
-        xaxis_title="Time",
-        yaxis_title="CVD"
+        title="XRP Multi-Exchange CVD (36h) + Binance Price",
+        yaxis=dict(title="CVD"),
+        yaxis2=dict(
+            title="Price",
+            overlaying="y",
+            side="right"
+        ),
+        height=800
     )
-    return fig
+
+    return fig.to_html(full_html=True)
+
+# ---------------- START ----------------
+def start_async():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(binance_trades())
+    loop.create_task(price_stream())
+    loop.run_forever()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050)
+    threading.Thread(target=start_async, daemon=True).start()
+    threading.Thread(target=aggregator, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
