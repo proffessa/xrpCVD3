@@ -208,7 +208,9 @@ def update(_):
             t, v, r = [], [], 0
             for ts, d in cvd[ex]["data"]:
                 r += d
-                t.append(ts)
+                from datetime import datetime
+
+t.append(datetime.fromtimestamp(ts / 1000))
                 v.append(r)
             fig.add_trace(go.Scatter(x=t, y=v, name=f"{ex} CVD"))
 
