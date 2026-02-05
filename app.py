@@ -9,20 +9,22 @@ from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
 
-# --------------------
+# =========================
 # GLOBAL DATA
-# --------------------
+# =========================
 EXCHANGES = ["Binance", "Coinbase", "OKX", "Bybit", "Kraken"]
 
 data = {ex: [] for ex in EXCHANGES}
 cvd = {ex: 0.0 for ex in EXCHANGES}
 
+price_data = []  # Binance XRP price
+
 LOCK = threading.Lock()
 
-# --------------------
-# WEBSOCKET TASKS
-# --------------------
-async def binance():
+# =========================
+# WEBSOCKETS
+# =========================
+async def binance_cvd():
     url = "wss://stream.binance.com:9443/ws/xrpusdt@trade"
     async with websockets.connect(url) as ws:
         while True:
@@ -33,6 +35,17 @@ async def binance():
             with LOCK:
                 cvd["Binance"] += delta
                 data["Binance"].append((datetime.utcnow(), cvd["Binance"]))
+
+
+async def binance_price():
+    url = "wss://stream.binance.com:9443/ws/xrpusdt@trade"
+    async with websockets.connect(url) as ws:
+        while True:
+            msg = json.loads(await ws.recv())
+            price = float(msg["p"])
+
+            with LOCK:
+                price_data.append((datetime.utcnow(), price))
 
 
 async def coinbase():
@@ -114,27 +127,30 @@ async def kraken():
                         cvd["Kraken"] += delta
                         data["Kraken"].append((datetime.utcnow(), cvd["Kraken"]))
 
-# --------------------
+
+# =========================
 # THREAD RUNNER
-# --------------------
+# =========================
 def run_ws(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(coro)
 
-threading.Thread(target=run_ws, args=(binance(),), daemon=True).start()
+
+threading.Thread(target=run_ws, args=(binance_cvd(),), daemon=True).start()
+threading.Thread(target=run_ws, args=(binance_price(),), daemon=True).start()
 threading.Thread(target=run_ws, args=(coinbase(),), daemon=True).start()
 threading.Thread(target=run_ws, args=(okx(),), daemon=True).start()
 threading.Thread(target=run_ws, args=(bybit(),), daemon=True).start()
 threading.Thread(target=run_ws, args=(kraken(),), daemon=True).start()
 
-# --------------------
+# =========================
 # DASH APP
-# --------------------
+# =========================
 app = Dash(__name__)
 
 app.layout = html.Div([
-    html.H3("XRP Spot CVD – Exchange Bazlı"),
+    html.H3("XRP – Exchange Based CVD + Binance Price"),
     dcc.Graph(id="cvd-graph"),
     dcc.Interval(id="interval", interval=2000)
 ])
@@ -154,16 +170,35 @@ def update(_):
                     x=df["time"],
                     y=df["cvd"],
                     mode="lines",
-                    name=ex
+                    name=f"{ex} CVD"
                 ))
+
+        if len(price_data) > 0:
+            pdf = pd.DataFrame(price_data, columns=["time", "price"])
+            fig.add_trace(go.Scatter(
+                x=pdf["time"],
+                y=pdf["price"],
+                mode="lines",
+                name="XRP Price (Binance)",
+                yaxis="y2",
+                line=dict(color="orange", width=2)
+            ))
 
     fig.update_layout(
         template="plotly_dark",
         xaxis=dict(title="UTC Time", type="date"),
         yaxis=dict(title="CVD"),
+        yaxis2=dict(
+            title="XRP Price",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
         legend=dict(orientation="h")
     )
+
     return fig
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8050, debug=False)
